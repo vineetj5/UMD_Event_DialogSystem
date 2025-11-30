@@ -14,6 +14,9 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy code into image
 COPY loader.py .
+COPY app.py .
 
-CMD ["python", "loader.py"]
+# .env will be provided at runtime via docker-compose (env_file)
+# command/entrypoint will be set per service in docker-compose.
