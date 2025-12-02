@@ -2,6 +2,7 @@ psycopg2-binary
 streamlit
 groq
 sentence-transformers
-torch
 numpy
 python-dotenv
+scikit-learn
+bertopic

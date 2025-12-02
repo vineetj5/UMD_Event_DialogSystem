@@ -1,7 +1,7 @@
 # app.py
 
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import psycopg2
@@ -11,31 +11,33 @@ from groq import Groq
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load .env when the container/app starts
+# --- BERTopic ---
+from bertopic import BERTopic
+
+# Load .env
 load_dotenv()
 
 # ============================
-#  CONFIG (from env with defaults)
+#  CONFIG
 # ============================
 
 DB_NAME = os.getenv("DB_NAME", "umd_events")
 DB_USER = os.getenv("DB_USER", "umd_user")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "umd_password")
-# default to "db" because that's the Docker service name
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_PORT = os.getenv("DB_PORT", "5432")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # must be set (via .env/env vars)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL_NAME",
-    "sentence-transformers/all-MiniLM-L6-v2"  # fast + decent quality
+    "sentence-transformers/all-MiniLM-L6-v2"
 )
 
 
 # ============================
-#  LOW-LEVEL HELPERS
+#  DATABASE HELPERS
 # ============================
 
 def get_db_connection():
@@ -49,31 +51,44 @@ def get_db_connection():
     )
     return conn
 
-
-@st.cache_resource
-def get_embedding_model() -> SentenceTransformer:
-    """Load the sentence-transformer model once and cache it."""
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-
-@st.cache_resource
-def get_groq_client() -> Groq:
-    if not GROQ_API_KEY:
-        raise RuntimeError(
-            "GROQ_API_KEY is not set. Put it in your .env file, e.g.\n"
-            "GROQ_API_KEY=your_key_here"
-        )
-    return Groq(api_key=GROQ_API_KEY)
-
+def init_db():
+    """
+    Ensure the DB schema supports topics.
+    1. Add topic_id column to umd_events if missing.
+    2. Create topic_labels table if missing.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # 1. Add topic_id to events table if it doesn't exist
+            cur.execute("""
+                ALTER TABLE umd_events 
+                ADD COLUMN IF NOT EXISTS topic_id INTEGER;
+            """)
+            
+            # 2. Create table for topic labels
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS topic_labels (
+                    topic_id INTEGER PRIMARY KEY,
+                    label TEXT,
+                    keywords TEXT
+                );
+            """)
+        conn.commit()
+    except Exception as e:
+        print(f"DB Init Error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
 def fetch_all_events() -> List[dict]:
-    """Load ALL events from the umd_events table as dicts."""
+    """Load ALL events, including their assigned topic_id."""
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute(
                 """
-                SELECT id, event, date, time, url, location, description
+                SELECT id, event, date, time, url, location, description, topic_id
                 FROM umd_events
                 ORDER BY id;
                 """
@@ -83,28 +98,80 @@ def fetch_all_events() -> List[dict]:
     finally:
         conn.close()
 
+def fetch_topic_map() -> Dict[int, str]:
+    """Returns a dict mapping topic_id -> Label (e.g. {0: 'Career Fair', 1: 'Music'})"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT topic_id, label FROM topic_labels WHERE topic_id != -1 ORDER BY label;")
+            rows = cur.fetchall()
+        return {row[0]: row[1] for row in rows}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+def update_event_topics(event_ids: List[int], topic_ids: List[int]):
+    """Bulk update topic_ids in the main events table."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            for eid, tid in zip(event_ids, topic_ids):
+                cur.execute(
+                    "UPDATE umd_events SET topic_id = %s WHERE id = %s;",
+                    (int(tid), int(eid))
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+def save_topic_labels(topic_data: List[dict]):
+    """Save the AI-generated labels to the topic_labels table."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Clear old labels first
+            cur.execute("TRUNCATE TABLE topic_labels;")
+            
+            for t in topic_data:
+                cur.execute(
+                    """
+                    INSERT INTO topic_labels (topic_id, label, keywords)
+                    VALUES (%s, %s, %s);
+                    """,
+                    (t['topic_id'], t['label'], ", ".join(t['keywords']))
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================
+#  ML / EMBEDDING
+# ============================
+
+@st.cache_resource
+def get_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+@st.cache_resource
+def get_groq_client() -> Groq:
+    return Groq(api_key=GROQ_API_KEY)
 
 def build_event_text(ev: dict) -> str:
-    """
-    Create a single text string for embedding:
-    combine title, date, location, description, etc.
-    """
     parts = [
         ev.get("event") or "",
-        ev.get("date") or "",
-        ev.get("time") or "",
-        ev.get("location") or "",
+        f"Date: {ev.get('date')}",
+        f"Time: {ev.get('time')}",
         ev.get("description") or "",
+        ev.get("location") or ""
     ]
-    return " | ".join(p.strip() for p in parts if p and p.strip())
+    return " ".join(p.strip() for p in parts if p)
 
-
-@st.cache_resource(show_spinner="Building semantic index from database...")
+@st.cache_resource(show_spinner="Building semantic index...")
 def build_semantic_index() -> Tuple[List[dict], np.ndarray]:
     """
-    1. Fetch all events from DB
-    2. Build embeddings for each
-    3. Return (events_list, embeddings_matrix)
+    Fetch events and build/cache embeddings.
     """
     events = fetch_all_events()
     if not events:
@@ -113,149 +180,222 @@ def build_semantic_index() -> Tuple[List[dict], np.ndarray]:
     model = get_embedding_model()
     texts = [build_event_text(ev) for ev in events]
     embeddings = model.encode(texts, normalize_embeddings=True)
-    embeddings = np.array(embeddings, dtype="float32")  # shape: (N, D)
+    embeddings = np.array(embeddings, dtype="float32")
 
     return events, embeddings
 
 
-def semantic_search(query: str, top_k: int = 5) -> List[Tuple[dict, float]]:
+# ============================
+#  TOPIC MODELING & LLM
+# ============================
+
+def generate_topic_label(keywords: List[str]) -> str:
+    """Asks Groq LLM to name a cluster."""
+    client = get_groq_client()
+    prompt = f"""
+    Keywords: {', '.join(keywords)}.
+    Provide a category name (max 4 words) for this event cluster. 
+    Examples: "Career Services", "Arts & Performance".
+    Return ONLY the name.
     """
-    Semantic search over all events using cosine similarity.
-    Returns list of (event_dict, score), sorted by score desc.
+    try:
+        resp = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=15, temperature=0.3
+        )
+        return resp.choices[0].message.content.strip().replace('"', '')
+    except:
+        return "General Events"
+
+def run_pipeline_and_save_topics():
+    """
+    1. Load data & embeddings.
+    2. Run BERTopic.
+    3. Generate Labels via LLM.
+    4. Save EVERYTHING to Postgres.
+    """
+    events, embeddings = build_semantic_index()
+    if len(events) < 5:
+        return "Not enough data to model topics."
+
+    docs = [build_event_text(ev) for ev in events]
+
+    # 1. Run BERTopic
+    topic_model = BERTopic(min_topic_size=3, verbose=True)
+    topics, probs = topic_model.fit_transform(docs, embeddings)
+    
+    # 2. Update Events Table with Topic IDs
+    event_ids = [ev['id'] for ev in events]
+    update_event_topics(event_ids, topics)
+
+    # 3. Generate Labels for discovered topics
+    topic_info = topic_model.get_topic_info()
+    structured_topics = []
+    
+    for index, row in topic_info.iterrows():
+        tid = row['Topic']
+        if tid != -1: # Skip noise
+            keywords = [x[0] for x in topic_model.get_topic(tid)[:5]]
+            label = generate_topic_label(keywords)
+            structured_topics.append({
+                "topic_id": int(tid),
+                "keywords": keywords,
+                "label": label
+            })
+            
+    # 4. Save Labels to DB
+    save_topic_labels(structured_topics)
+    
+    # Clear cache so next search picks up new topics
+    build_semantic_index.clear()
+    
+    return f"Successfully processed {len(structured_topics)} topics and updated database."
+
+
+# ============================
+#  SEARCH & RAG
+# ============================
+
+def semantic_search(query: str, top_k: int = 5, filter_topic_id: Optional[int] = None) -> List[Tuple[dict, float]]:
+    """
+    Search with optional Topic Filtering.
     """
     events, emb_matrix = build_semantic_index()
-    if len(events) == 0:
+    if not events: 
         return []
 
     model = get_embedding_model()
-    q_emb = model.encode([query], normalize_embeddings=True)[0]  # (D,)
-    q_emb = q_emb.astype("float32")
+    q_emb = model.encode([query], normalize_embeddings=True)[0].astype("float32")
 
-    # cosine similarity because all vectors are normalized
-    scores = emb_matrix @ q_emb  # (N,)
+    scores = emb_matrix @ q_emb
+    
+    scored_events = []
+    for idx, ev in enumerate(events):
+        scored_events.append((ev, float(scores[idx])))
 
-    top_k = min(top_k, len(events))
-    top_indices = np.argsort(-scores)[:top_k]
+    # Apply Filtering if requested
+    if filter_topic_id is not None:
+        scored_events = [
+            (ev, s) for (ev, s) in scored_events 
+            if ev.get('topic_id') == filter_topic_id
+        ]
 
-    results: List[Tuple[dict, float]] = []
-    for idx in top_indices:
-        results.append((events[idx], float(scores[idx])))
+    scored_events.sort(key=lambda x: x[1], reverse=True)
 
-    return results
+    return scored_events[:top_k]
 
-
-def format_events_for_context(events_with_scores: List[Tuple[dict, float]]) -> str:
-    """Turn retrieved events into a text block to feed into the LLM."""
-    if not events_with_scores:
-        return "No matching events were found in the database."
-
-    lines = []
-    for i, (ev, score) in enumerate(events_with_scores, 1):
-        lines.append(f"[{i}] Event: {ev.get('event', 'N/A')}")
-        lines.append(f"    Date: {ev.get('date', 'N/A')}")
-        lines.append(f"    Time: {ev.get('time', 'N/A')}")
-        lines.append(f"    Location: {ev.get('location', 'N/A')}")
-        lines.append(f"    URL: {ev.get('url', 'N/A')}")
-        desc = (ev.get("description") or "").strip()
-        if desc:
-            lines.append(
-                f"    Description: {desc[:400]}{'...' if len(desc) > 400 else ''}"
-            )
-        lines.append(f"    Semantic score: {score:.3f}")
-        lines.append("")  # blank line
-
-    return "\n".join(lines)
-
-
-def call_groq_rag(
-    user_question: str,
-    events_with_scores: List[Tuple[dict, float]]
-) -> str:
-    """Call Groq LLM with RAG context."""
+def call_groq_rag(query, retrieved_events, history):
     client = get_groq_client()
+    
+    context_text = "\n\n".join([
+        f"Event: {ev['event']}\nDate: {ev['date']}\nDesc: {ev['description'][:300]}"
+        for ev, score in retrieved_events
+    ])
+    
+    if not context_text:
+        context_text = "No specific events found matching criteria."
 
-    context_block = format_events_for_context(events_with_scores)
+    # Fetch topics to give the LLM context about what's available
+    topic_map = fetch_topic_map()
+    topic_list = ", ".join(topic_map.values())
 
-    system_prompt = (
-        "You are an assistant that helps students explore events from the "
-        "University of Maryland campus calendar.\n"
-        "You are given retrieved event entries from a database.\n"
-        "Use ONLY this information to answer the user's question.\n"
-        "If the answer is not in the events, say you don't know.\n"
-        "Always mention the event title and date when recommending something."
+    sys_prompt = (
+        "You are a helpful UMD Events assistant. "
+        f"Today's date is roughly Oct 1, 2025 (simulated). "
+        f"The available event categories are: {topic_list}. "
+        "Answer the user's question using the Context below. "
+        "If the user asks about a specific topic, check if it matches one of the categories. "
+        "If the context doesn't help, say so politely."
     )
+    
+    messages = [{"role": "system", "content": sys_prompt}]
+    messages.extend(history[-6:])
+    messages.append({
+        "role": "user", 
+        "content": f"Context:\n{context_text}\n\nUser Question: {query}"
+    })
 
-    user_prompt = f"""
-Here are the retrieved events:
-
-{context_block}
-
-User question: {user_question}
-
-Answer concisely. Use bullet points when recommending multiple events.
-If appropriate, reference specific events by their index [1], [2], etc.
-"""
-
-    chat_completion = client.chat.completions.create(
-        model=GROQ_MODEL,
-        temperature=0.2,
-        max_tokens=512,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+    resp = client.chat.completions.create(
+        model=GROQ_MODEL, messages=messages, temperature=0.2
     )
-
-    return chat_completion.choices[0].message.content.strip()
+    return resp.choices[0].message.content
 
 
 # ============================
-#  STREAMLIT UI
+#  UI MAIN
 # ============================
 
-st.set_page_config(page_title="UMD Events Semantic RAG", page_icon="🎓")
+# 1. Initialize DB schema on first run
+init_db()
 
-st.title("🎓 UMD Events Assistant (Semantic RAG + Groq)")
-st.write(
-    "Ask questions about campus events. "
-    "Search is **semantic** (embeddings), not just keyword matching."
-)
+# FIXED: Removed corrupted characters in page config
+st.set_page_config(page_title="UMD Smart Events", page_icon="🐢", layout="wide")
+
+# FIXED: Replaced mojibake with Turtle emoji
+st.title("🐢 UMD Events RAG + Topic Modeling")
+
+# Initialize Session State
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Fetch topics for Sidebar
+available_topics = fetch_topic_map() 
+# {id: "Label"}
 
 with st.sidebar:
-    st.header("Settings")
-    top_k = st.slider("Number of events to retrieve (top_k)", 1, 10, 5)
-    st.markdown("---")
-    st.markdown("**DB connection**")
-    st.write(f"Host: `{DB_HOST}`")
-    st.write(f"DB: `{DB_NAME}`")
-    st.write(f"User: `{DB_USER}`")
-    st.markdown("---")
-    if st.button("🔁 Rebuild semantic index"):
-        build_semantic_index.clear()
-        st.success("Semantic index will be rebuilt on next query.")
+    st.header("Search Filters")
+    
+    # TOPIC FILTER DROPDOWN
+    selected_topic_label = st.selectbox(
+        "Filter by Topic",
+        options=["All Topics"] + list(available_topics.values())
+    )
+    
+    # Map label back to ID
+    filter_id = None
+    if selected_topic_label != "All Topics":
+        # Invert dict to find ID
+        for tid, label in available_topics.items():
+            if label == selected_topic_label:
+                filter_id = tid
+                break
+    
+    top_k = st.slider("Results (Top K)", 1, 10, 5)
+    
+    st.divider()
+    st.header("Admin Controls")
+    
+    # FIXED: Replaced mojibake with Brain emoji
+    if st.button("🧠 Analyze & Save Topics"):
+        with st.spinner("Clustering events, generating labels, and saving to DB..."):
+            msg = run_pipeline_and_save_topics()
+            st.success(msg)
+            # Force reload to update sidebar
+            st.rerun()
 
-question = st.text_input(
-    "Ask about events (e.g., *What career fairs are happening in October?*)"
-)
+# Chat Interface
+for msg in st.session_state.messages:
+    st.chat_message(msg["role"]).write(msg["content"])
 
-if st.button("Ask") and question.strip():
-    with st.spinner("Running semantic search and calling Groq..."):
-        retrieved = semantic_search(question, top_k=top_k)
+if prompt := st.chat_input("Ask about events..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.chat_message("user").write(prompt)
 
-        if not retrieved:
-            st.warning("No events found in the database.")
-        else:
-            st.subheader("🔎 Retrieved Events (Semantic matches)")
-            for i, (ev, score) in enumerate(retrieved, 1):
-                with st.expander(f"[{i}] {ev.get('event', 'N/A')}  (score={score:.3f})"):
-                    st.markdown(f"**Date:** {ev.get('date', 'N/A')}")
-                    st.markdown(f"**Time:** {ev.get('time', 'N/A')}")
-                    st.markdown(f"**Location:** {ev.get('location', 'N/A')}")
-                    st.markdown(f"**URL:** {ev.get('url', 'N/A')}")
-                    st.markdown("**Description:**")
-                    st.write(ev.get("description", "N/A"))
+    with st.spinner("Searching..."):
+        # 1. Search with Filter
+        results = semantic_search(prompt, top_k=top_k, filter_topic_id=filter_id)
+        
+        # 2. Generate Answer
+        answer = call_groq_rag(prompt, results, st.session_state.messages)
+        
+        # 3. Display
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+            if results:
+                with st.expander("See Sources"):
+                    for ev, score in results:
+                        st.markdown(f"**{ev['event']}** ({score:.2f})")
+                        st.caption(f"Topic: {available_topics.get(ev.get('topic_id'), 'Uncategorized')}")
 
-            answer = call_groq_rag(question, retrieved)
-
-            st.subheader("💬 Assistant Answer")
-            st.write(answer)
+    st.session_state.messages.append({"role": "assistant", "content": answer})
