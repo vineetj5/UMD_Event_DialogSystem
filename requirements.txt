@@ -1,36 +1,42 @@
-bertopic
-rank-bm25
-# --- Core App Dependencies ---
-streamlit
-python-dotenv
-psycopg2-binary
-groq
-requests
-numpy
-pandas
+# requirements.txt
 
-# --- Embeddings ---
-sentence-transformers
+# --- Core App Dependencies ---
+streamlit==1.39.0
+python-dotenv==1.0.1
+psycopg2-binary==2.9.9
+groq>=0.13.0
+requests==2.32.3
+numpy==1.26.4
+pandas==2.2.3
+
+# --- MISSING DEPENDENCIES FIX ---
+python-dateutil
+pytz
+
+# --- Embeddings & Topic Modeling ---
+sentence-transformers==3.1.1
+bertopic==0.16.0
+umap-learn==0.5.7
+scikit-learn==1.5.2
+rank-bm25==0.2.2
 
 # --- RAG Evaluation ---
 datasets>=2.14.0
 ragas>=0.1.0
 
-# ragas dependency: requires langchain community support
-langchain
-langchain-community
-langchain-core
+# --- LangChain ---
+langchain==0.3.1
+langchain-community==0.3.1
+langchain-core==0.3.6
+openai==1.51.0
 
-# Optional (but recommended for RAGAS LLM support)
-openai
+# --- Metrics ---
+bert-score==0.3.13
+rouge-score==0.1.2
+evaluate==0.4.3
 
-# --- Metrics for Generator Evaluation ---
-bert-score
-rouge-score
-
-# --- Web scraping (if needed for ingestion) ---
-beautifulsoup4
-tqdm
-
-# --- Utility ---
-scikit-learn
+# --- Utilities ---
+beautifulsoup4==4.12.3
+lxml==5.3.0
+tqdm==4.66.5
+plotly==5.24.1

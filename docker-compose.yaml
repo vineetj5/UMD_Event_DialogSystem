@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16
+    image: pgvector/pgvector:pg16  # <-- CHANGED: pgvector-enabled image (includes extension)
     container_name: umd_events_db
     environment:
       POSTGRES_DB: umd_events
@@ -10,13 +10,19 @@ services:
       - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
+    # Optional: Healthcheck for better depends_on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umd_user -d umd_events"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   loader:
     build: .
     container_name: umd_events_loader
     depends_on:
-      - db
-    # share same envs as app/db where relevant
+      db:
+        condition: service_healthy  # <-- ADDED: Wait for DB health
     environment:
       POSTGRES_DB: umd_events
       POSTGRES_USER: umd_user
@@ -25,30 +31,40 @@ services:
       POSTGRES_PORT: "5432"
       EVENTS_JSON_NAME: "umd_calendar_2025-10-01_to_2025-10-31.json"
     volumes:
-      - .:/app
+      - .:/app  # Mount for JSON file access
     command: ["python", "loader.py"]
-    restart: "no"
+    restart: "no"  # Run once to load data
 
   app:
     build: .
     container_name: umd_events_app
     depends_on:
       loader:
-        condition: service_completed_successfully
+        condition: service_completed_successfully  # Wait for data load
+      db:
+        condition: service_healthy
     env_file:
-      - .env   # contains GROQ_API_KEY, can also contain DB_* overrides
+      - .env  # GROQ_API_KEY, etc.
     environment:
-      # Ensure app talks to the db service, not localhost
+      # DB envs (overrides .env if needed)
       DB_NAME: umd_events
       DB_USER: umd_user
       DB_PASSWORD: umd_password
       DB_HOST: db
       DB_PORT: "5432"
+      # App-specific (from your env)
+      EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
+      CROSS_ENCODER_MODEL_NAME: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+      GROQ_API_KEY: "${GROQ_API_KEY}"  # From .env
+      GROQ_MODEL: "llama-3.3-70b-versatile"
     volumes:
-      - .:/app
+      - .:/app  # For code changes/hot-reload in dev
     command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
     ports:
       - "8501:8501"
+    # Optional: For dev, enable auto-reload
+    # stdin_open: true
+    # tty: true
 
 volumes:
-  db_data:
+  db_data:  # Persists DB data across restarts
