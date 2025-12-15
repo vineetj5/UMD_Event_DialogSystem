@@ -9,6 +9,8 @@ from typing import List, Dict
 import numpy as np # Helper import for pipeline
 import psycopg2
 from sentence_transformers import SentenceTransformer
+
+from psycopg2 import pool
 from elasticsearch import Elasticsearch
 # from groq import Groq
 from dotenv import load_dotenv
@@ -59,15 +61,47 @@ llm_client = OpenAI(
 #  DATABASE & SEARCH LOGIC
 # ============================
 
-def get_db_connection():
-    return psycopg2.connect(
+from contextlib import contextmanager
+
+# 1. Create a Global Connection Pool (Runs once on startup)
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(
+        1, 20, # Min 1, Max 20 connections
         dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port="5432"
     )
+    if db_pool:
+        logger.info("✅ Database connection pool created successfully")
+except Exception as e:
+    logger.error(f"❌ Error creating connection pool: {e}")
+
+# 2. Helper to get a cursor from the pool
+@contextmanager
+def get_db_cursor(cursor_factory=None):
+    """
+    Yields a cursor from a pooled connection, then automatically puts the connection back.
+    Usage:
+        with get_db_cursor() as cur:
+            cur.execute(...)
+    """
+    conn = db_pool.getconn()
+    try:
+        # Support for DictCursor or standard cursor
+        if cursor_factory:
+            yield conn.cursor(cursor_factory=cursor_factory)
+        else:
+            yield conn.cursor()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        db_pool.putconn(conn)
+
 
 def init_db():
-    conn = get_db_connection()
+    # conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
+        with get_db_cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             cur.execute("ALTER TABLE umd_events ADD COLUMN IF NOT EXISTS topic_id INTEGER;")
             cur.execute("ALTER TABLE umd_events ADD COLUMN IF NOT EXISTS embedding VECTOR(384);")
@@ -82,25 +116,23 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS umd_events_embedding_idx 
                 ON umd_events USING hnsw (embedding vector_cosine_ops);
             """)
-        conn.commit()
+        
     except Exception as e:
         logger.error(f"DB Init Error: {e}")
         conn.rollback()
-    finally:
-        conn.close()
+ 
 
 def fetch_topic_map() -> Dict[str, str]:
     """Returns { 'Career': '1', 'Music': '2' } for the dropdown."""
-    conn = get_db_connection()
+    # conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
+        with get_db_cursor() as cur:
             cur.execute("SELECT topic_id, label FROM topic_labels WHERE topic_id != -1 ORDER BY label;")
             # Return Label -> ID mapping for the UI
             return {row[1]: str(row[0]) for row in cur.fetchall()}
     except Exception:
         return {}
-    finally:
-        conn.close()
+ 
 
 def search_events(query_text, top_k=5, filter_topic_id=None):
     # 1. Vector Search
@@ -187,13 +219,14 @@ def run_topic_modeling_pipeline():
     """
     from bertopic import BERTopic
     from psycopg2.extras import DictCursor
+    
 
     # 1. Fetch Data
-    conn = get_db_connection()
+   # conn = get_db_connection()
     events = []
     embeddings = []
     try:
-        with conn.cursor(cursor_factory=DictCursor) as cur:
+        with get_db_cursor(cursor_factory=DictCursor) as cur:
             cur.execute("SELECT id, event, description, embedding FROM umd_events")
             rows = cur.fetchall()
             for r in rows:
@@ -204,7 +237,7 @@ def run_topic_modeling_pipeline():
                 events.append(dict(r))
                 embeddings.append(emb)
     finally:
-        conn.close()
+        pass
 
     if len(events) < 5: return "Not enough data."
     
@@ -221,14 +254,13 @@ def run_topic_modeling_pipeline():
     topics, _ = topic_model.fit_transform(docs, embeddings_np)
 
     # 3. Update Postgres (The Source of Truth)
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
+        with get_db_cursor() as cur:
             for ev, tid in zip(events, topics):
                 cur.execute("UPDATE umd_events SET topic_id = %s WHERE id = %s", (int(tid), ev['id']))
         conn.commit()
     finally:
-        conn.close()
+        pass
 
     # 4. Sync Elasticsearch (CRITICAL STEP)
     # We update Elastic so the "Filter by Topic" feature works in search
@@ -247,9 +279,8 @@ def run_topic_modeling_pipeline():
 
     # 5. Generate & Save Labels (Using Groq)
     topic_info = topic_model.get_topic_info()
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
+        with get_db_cursor() as cur:
             cur.execute("TRUNCATE TABLE topic_labels")
             for _, row in topic_info.iterrows():
                 tid = row['Topic']
@@ -276,7 +307,7 @@ def run_topic_modeling_pipeline():
                             (int(tid), label, ", ".join(keywords)))
         conn.commit()
     finally:
-        conn.close()
+        pass
         
     return f"Pipeline Complete. Synced {success_count} events to Elastic."
 
@@ -296,11 +327,9 @@ async def start():
     await start_msg.send()
 
     # CHECK: Is this the first run?
-    conn = get_db_connection()
-    with conn.cursor() as cur:
+    with get_db_cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM umd_events WHERE topic_id = -1;")
         uncategorized_count = cur.fetchone()[0]
-    conn.close()
 
     if uncategorized_count > 0:
         # --- FIX 1: Set content property, then update ---
@@ -340,9 +369,32 @@ async def start():
     cl.user_session.set("topic_map", topic_map)
     cl.user_session.set("settings", {"topic_filter": "All Topics", "top_k": 5})
 
-    # --- FIX 3: (This was already correct in your code, but kept for consistency) ---
-    start_msg.content = f"✅ **Ready!** I know about {len(topic_map)} categories of events.\n\nType a query like 'Free food next week' to start!"
+    # 4. Initialize History (Critical for Memory)
+    cl.user_session.set("history", [])
+
+    # 5. Define Quick Actions
+    actions = [
+        cl.Action(name="quick_search", value="Is there free food today?", label="🍕 Free Food"),
+        cl.Action(name="quick_search", value="Career fairs this month", label="💼 Career Fairs"),
+        cl.Action(name="quick_search", value="Music performances next week", label="🎵 Music"),
+        cl.Action(name="quick_search", value="Sports games this weekend", label="🐢 Sports"),
+    ]
+
+    # 6. Final Update with Actions
+    # We update the existing start_msg instead of sending a new one to keep the chat clean
+    start_msg.content = f"✅ **Ready!** I know about {len(topic_map)} categories of events.\n\nClick a button or type a query to start!"
+    start_msg.actions = actions
     await start_msg.update()
+
+    # --- NEW CALLBACK FUNCTION ---
+    # (Paste this OUTSIDE and BELOW the start() function)
+    @cl.action_callback("quick_search")
+    async def on_action(action: cl.Action):
+        # This simulates the user typing the label text
+        await cl.Message(content=action.value, author="User").send()
+        # Pass the fake message to your main function to trigger the search
+        await main(cl.Message(content=action.value))
+
 
 @cl.on_settings_update
 async def setup_agent(settings):
@@ -462,6 +514,7 @@ async def main(message: cl.Message):
             elements=[csv_file]
         ).send()
         return
+    history = cl.user_session.get("history", [])
     # 1. Retrieve Settings
     settings = cl.user_session.get("settings")
     topic_map = cl.user_session.get("topic_map")
@@ -495,7 +548,7 @@ async def main(message: cl.Message):
         f"Event: {ev['event']}\nDate: {ev['date']}\nDesc: {ev['description'][:300]}"
         for ev, score in results
     ]) or "No events found."
-
+    history_text = "\n".join([f"User: {h['user']}\nBot: {h['bot']}" for h in history[:]])
     current_date = datetime.now().strftime("%B %Y")
     sys_prompt = f"""
     You are TestudoBot, a knowledgeable, friendly, and enthusiastic AI assistant for University of Maryland (UMD) events. Your goal: Help users discover lectures, career fairs, performances, workshops, and more – using ONLY the provided Context. Do not invent details, dates, or URLs. If Context lacks info, say so politely and suggest alternatives from data.
@@ -545,12 +598,52 @@ async def main(message: cl.Message):
         if chunk.choices[0].delta.content:
             await msg.stream_token(chunk.choices[0].delta.content)
 
-    # 4. Attach Sources to the final message
+# 4. Attach Sources to the final message
+# 4. Attach Sources to the final message (Rich Cards)# 4. Attach Sources to the final message (Rich Cards)
+# 4. Attach Sources to the final message (Smart Rich Cards)
     if results:
-        elements = [
-            cl.Text(name=f"Source {i+1}", content=f"{ev['event']}\n{ev['date']}\n{ev['description']}", display="inline")
-            for i, (ev, _) in enumerate(results)
-        ]
+        elements = []
+        for i, (ev, score) in enumerate(results):
+            
+            # --- Build the Card Content Dynamically ---
+            lines = []
+            
+            # 1. Date & Time (Combine if time exists)
+            date_str = ev.get('date', 'N/A')
+            if ev.get('time'):
+                date_str += f" at {ev['time']}"
+            lines.append(f"**📅 When:** {date_str}")
+            
+            # 2. Location
+            lines.append(f"**📍 Where:** {ev.get('location', 'TBD')}")
+            
+            # 3. URL (Only add if it exists)
+            if ev.get('url'):
+                lines.append(f"**🔗 Link:** [Official Event Page]({ev['url']})")
+            
+            # 4. Score (Good for debugging, maybe optional for users)
+            lines.append(f"**📊 Match:** {score:.2f}")
+            
+            # 5. Description (Expanded to 350 chars to catch contact info)
+            desc = ev.get('description', '')[:350]
+            # Add "..." if we cut it off
+            if len(ev.get('description', '')) > 350:
+                desc += "..."
+            
+            lines.append(f"\n**📝 Details:**\n{desc}")
+
+            # Join lines with newlines
+            source_content = "\n".join(lines)
+
+            # --- Create the Element ---
+            elements.append(
+                cl.Text(
+                    name=f"{i+1}. {ev['event']}", 
+                    content=source_content,
+                    display="inline"
+                )
+            )
         msg.elements = elements
-    
     await msg.update()
+    history.append({"user": message.content, "bot": msg.content}) 
+    cl.user_session.set("history", history)
