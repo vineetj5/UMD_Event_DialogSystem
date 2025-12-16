@@ -532,8 +532,8 @@ def scrape_day(d: date):
 
 
 def main():
-    start = date(2025, 10, 1)
-    end   = date(2025, 10, 2)
+    start = date(2025, 12, 1)
+    end   = date(2026, 1, 31)
 
     seen_urls = set()
     collected = []

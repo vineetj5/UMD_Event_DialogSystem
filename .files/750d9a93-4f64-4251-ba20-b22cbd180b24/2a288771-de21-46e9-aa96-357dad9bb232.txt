@@ -1,0 +1,6 @@
+**📅 When:** 2025-11-05 at 2:00pm - 3:00pm
+**📍 Where:** Location Online Registration Link: Learn more and register here Link to LibCal Library event
+**🔗 Link:** [Official Event Page](https://calendar.umd.edu/intro-to-python-5)
+
+**📝 Details:**
+The Data Science/GIS workshop series is powered by GIS and Data Service Center, and Research Education at University Libraries. This workshop series offers introductory to advanced level skills in GIS, Data Science, Data Visualization among others. Python is a high-level programming language used for solving range of problems from machine learning ...
